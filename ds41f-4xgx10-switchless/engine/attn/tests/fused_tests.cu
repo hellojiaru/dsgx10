@@ -858,6 +858,15 @@ void test_chain(int rows, int ratio, int ctx) {
 
 int main() {
   CUDA_CHECK(cudaStreamCreate(&g_s));
+  // Compare dense selection with the independent score/top-k path at the
+  // uint16 block-list boundary and full 1M context, including forced fallback.
+  for (int rows : {1, 6}) {
+    test_dense(rows, 1, 524288, true, -1);
+    test_dense(rows, 1, 524296, true, -1);
+    test_dense(rows, 1, 1048576, true, -1);
+    test_dense(rows, 1, 1048576, true, 0);
+    test_dense(rows, 2, 1048576, false, -1);
+  }
   for (int rows : {1, 6, 8, 9, 12, 16}) {
     const bool one_session = rows <= attn::kDecodeGroup;  // decode_prep: at most 8 rows a session
     test_mhc(rows);

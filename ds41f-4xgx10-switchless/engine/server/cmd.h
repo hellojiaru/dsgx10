@@ -53,6 +53,8 @@ constexpr int kMaxStop = 32;
 constexpr int kMaxSnaps = 8;
 constexpr int kMaxOps = 12;
 enum : int32_t {
+  kCmdVision = 9,   // current chunk: n VisionSpan records and rows*5120 BF16 words
+  kCmdVisionLayout = 10, // full request/resume layout: n VisionSpan records, no feature bytes
   kCmdStop = 0,     // leave the command loop
   kCmdStep = 1,     // a golden-mode step (model::Ctl)
   kCmdDecode = 2,   // decode_loop
@@ -66,9 +68,11 @@ enum : int32_t {
   kCmdBatchTf = 20,
   kCmdSpecBatch = 8,  // spec_batch_loop (B3): the same with drafts; the Cmd's spec_* fields as kCmdDecode's
 };
-enum : uint32_t { kPfSample = 1, kPfCed = 2 };  // kPfCed: a CED chunk (Model::prefill's ced, docs/ced.md)
+enum : uint32_t { kPfSample = 1, kPfCed = 2, kPfTailExact = 4 };
+// kPfCed: a CED chunk; kPfTailExact selects the bounded 2560-row decoder dependency cone.
 struct Cmd {
   int32_t op = kCmdStop;
+  int32_t creative = 0;  // every rank changes the device scalar at this drained boundary
   int32_t rows = 0, pos0 = 0;  // kCmdStep, kCmdRows, kCmdPrefill: the rows; kCmdDecode: the first position
   uint32_t flags = 0;
   // >= 0: the session slot (Model::use_slot) this command and the ones after it act on, from its state
@@ -141,6 +145,19 @@ struct DecodeEnd {
                        // drafts; the draft module's windows hold its block keys up to 5 past the anchor)
   // DSpark: verify steps, the drafts they verified and accepted, and how many verified 0..5
   int vsteps = 0, verified = 0, accepted = 0;
+  // Evaluated verification rows (including rows discarded after the first rejection).
+  int prob_rows = 0, prob_accept = 0, prob_reject = 0, prob_fallback = 0, prob_skipped = 0, residual_zero = 0;
+  void probability(const model::SampleOut& o, int r0, int nr) {
+    for (int r = r0; r < r0 + nr; ++r) {
+      const auto f = o.row[r].flags;
+      prob_rows += !!(f & model::ops::kSampProb);
+      prob_accept += !!(f & model::ops::kSampProb) && !(f & model::ops::kSampProbReject);
+      prob_reject += !!(f & model::ops::kSampProbReject);
+      prob_fallback += !!(f & model::ops::kSampProbFallback);
+      prob_skipped += !!(f & model::ops::kSampProbSkipped);
+      residual_zero += !!(f & model::ops::kSampResidualZero);
+    }
+  }
   int rows_hist[model::ops::kDrafts + 1] = {};
   double gpu_ms[model::kMaxRows + 1] = {};  // spec steps' GPU time (rows, draft pass) by rows, summed
   int gpu_n[model::kMaxRows + 1] = {};

@@ -811,7 +811,10 @@ __global__ void __launch_bounds__(kSelThreads) index_dense_kernel(IndexDenseArgs
   for (int r = first; r < R; r += S) {
     const int nr = s.blocks ? s.nblocks * 8 : slen[last_of(r)];  // the session's
     select_dense(a.top, r, gk + r * 2048, nr, a.cap, ckey, cidx,
-                 nr > kDenseBmax ? s.bkeys + (size_t)r * s.bkeys_stride : nullptr, blist);
+                 // The optional block list stores 16-bit block indices. Past
+                 // 524288 keys, use select_bins' full-key gather; scores, exact
+                 // threshold selection and stable tie ordering are unchanged.
+                 nr > kDenseBmax && nr <= 65536 * 8 ? s.bkeys + (size_t)r * s.bkeys_stride : nullptr, blist);
     if (pool) {
       __syncthreads();
       select_dense(a.pool, r, gb + r * 2048, (nr + 7) / 8, a.cap, ckey, cidx, nullptr, nullptr);
@@ -978,8 +981,7 @@ void index_dense(const uint16_t* iq_pre, const float* wproj, const int* pos, con
                  IndexKeys ik, int max_scan, uint16_t* keys, int keys_stride, uint16_t* bkeys, int bkeys_stride,
                  IndexSel top, IndexSel pool, uint32_t* scratch, bool pdl, cudaStream_t s, int cand) {
   int padded = (max_scan + kScorePos - 1) / kScorePos * kScorePos;
-  if (rows < 1 || rows > kMaxDecodeRows || keys_stride < padded || !bkeys || bkeys_stride < padded / 8 ||
-      bkeys_stride > 65536)  // select_bins lists blocks by 16-bit index
+  if (rows < 1 || rows > kMaxDecodeRows || keys_stride < padded || !bkeys || bkeys_stride < padded / 8)
     die("index_dense: %d rows, strides %d/%d for %d", rows, keys_stride, bkeys_stride, max_scan);
   const int sms = dense_sms();
   const IndexScan whole{};

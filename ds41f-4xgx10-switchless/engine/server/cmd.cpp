@@ -1,5 +1,6 @@
 // Rank 0's commands and what every rank runs alike (cmd.h).
 #include "server/cmd.h"
+#include "server/runtime_metrics.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -71,6 +72,7 @@ void apply_state(model::Model& m, const StateOp& o) {
 }
 
 void apply_ops(model::Model& m, const Cmd& c) {
+  m.set_creative(c.creative);
   if (c.slot >= 0) m.use_slot(c.slot);
   std::vector<int> pin;
   for (int i = 0; i < c.n_ops; ++i) {
@@ -116,7 +118,8 @@ model::Ctl to_ctl(const Cmd& c) {
 uint64_t run_prefill(model::Model& m, const Cmd& c) {
   const std::vector<int> snaps(c.snaps, c.snaps + c.n_snaps);
   const uint64_t n =
-      m.prefill(c.pos0, c.rows, (c.flags & kPfSample) ? &c.sp : nullptr, c.handle, snaps, (c.flags & kPfCed) != 0);
+      m.prefill(c.pos0, c.rows, (c.flags & kPfSample) ? &c.sp : nullptr, c.handle, snaps, (c.flags & kPfCed) != 0,
+                (c.flags & kPfTailExact) ? model::kCedTailRows : model::kCedReplayRows);
   if (c.next > 0) m.prefill_lookup(c.pos0 + c.rows, c.next);
   return n;
 }
@@ -202,6 +205,8 @@ DecodeEnd spec_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSample&
     e.written = std::max(e.written, o.pos0 + std::max(o.step_rows, o.rows + kD));
     if (i > 0) {
       ++e.vsteps, e.verified += o.step_rows - 1, e.accepted += o.rows - 1;
+      e.probability(o, 0, o.step_rows - 1);
+      if (g_runtime_metrics) g_runtime_metrics->verify(o.step_rows - 1, o.rows - 1);
       ++e.rows_hist[std::min(o.step_rows - 1, kD)];
     }
     if (i > 4)  // the step before (done; past the graphs' captures): its GPU time by its rows
@@ -649,6 +654,8 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
       }
       if (i > 0) {
         ++d.vsteps, d.verified += sr - 1, d.accepted += er - 1;
+        d.probability(o, r0, sr - 1);
+        if (g_runtime_metrics) g_runtime_metrics->verify(sr - 1, er - 1);
         ++d.rows_hist[std::min(sr - 1, kD)];
       }
       rate[k].add(c, er, sr);
@@ -745,6 +752,18 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       std::vector<std::vector<int32_t>> t;
       bcast_tf(ring, c, e, t, rank);
       batch_tf_loop(m, c, e, t, wd, nullptr);
+    } else if (c.op == kCmdVision) {
+      if (c.n < 0 || c.n > c.rows || c.rows < 0 || c.rows > model::kMaxVisionRows) die("bad vision command");
+      std::vector<model::ops::VisionSpan> spans(c.n);
+      std::vector<uint16_t> features((size_t)c.rows * model::kDim);
+      bcast_payload(ring, spans.data(), spans.size() * sizeof(spans[0]), rank);
+      bcast_payload(ring, features.data(), features.size() * 2, rank);
+      m.set_vision_chunk(spans, features.data(), c.rows);
+    } else if (c.op == kCmdVisionLayout) {
+      if (c.n < 0 || c.n > 4096) die("bad vision layout command");
+      std::vector<model::ops::VisionSpan> spans(c.n);
+      bcast_payload(ring, spans.data(), spans.size() * sizeof(spans[0]), rank);
+      m.set_vision_layout(spans);
     } else if (c.op == kCmdTokens) {
       std::vector<int32_t> t(c.n);
       bcast_payload(ring, t.data(), t.size() * 4, rank);

@@ -8,6 +8,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <cmath>
 
 #include "model/impl.h"
 #include "model/prefill.h"
@@ -277,6 +279,7 @@ void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
       w.gate = dalloc<uint8_t>((size_t)kExperts * kDim * 2);
       comm::allgather(ch, g, w.gate, (size_t)kGatePart * kDim * 2, st);
       w.gate_bias = reinterpret_cast<const float*>(need(p + "ffn.gate.bias", DType::F32, {kExperts}));
+      w.gate_bias_vl = reinterpret_cast<const float*>(need(p + "ffn.gate.bias_vl", DType::F32, {kExperts}));
     }
     {
       dsk::MoeWeights& m = w.moe;
@@ -417,7 +420,7 @@ attn::CompressorCarry Model::Impl::step_carry(int k) const {
 // records of both Engram layers (completion seqs seq[0], seq[1]); the GPU waits for them only when it
 // reaches layer 1 / 14.
 void Model::Impl::engram_prepare(int pos0, int R, const uint64_t seq[2]) {
-  engram::hash_positions(*emap, hist.data(), nullptr, pos0, R, ids.data());
+  engram::hash_positions(*emap, hist.data(), live_of(cur_slot), pos0, R, ids.data());
   engram_submit(R, seq);
 }
 
@@ -430,7 +433,7 @@ void Model::Impl::engram_rows(int R, const int32_t* tok, const int32_t* pos, con
   }
   for (int r0 = 0, r1; r0 < R; r0 = r1) {  // a session's rows: consecutive positions of one slot
     for (r1 = r0 + 1; r1 < R && slot[r1] == slot[r0] && pos[r1] == pos[r1 - 1] + 1;) ++r1;
-    engram::hash_positions(*emap, hist_of(slot[r0]).data(), nullptr, pos[r0], r1 - r0,
+    engram::hash_positions(*emap, hist_of(slot[r0]).data(), live_of(slot[r0]), pos[r0], r1 - r0,
                            ids.data() + (size_t)r0 * 2 * kEngramCols);
   }
   engram_submit(R, seq);
@@ -554,6 +557,11 @@ void Model::Impl::attention(int L, int R, int ctx, bool dumps, bool sub_in, Sink
   // hc_post into mid and the FFN's collapse (by attn_pre) in the same kernel
   dsk::gemv_woa(o, R, w.woa, w.soa, kOPart, kWoaK, kOGroupRows, nullptr, cwoa, false, st, oq, os);
   dsk::gemv_fp8(oq, os, R, w.wob, w.sob, kDim, kOPart, part, c8, st);
+  // A linear projection commutes with the TP sum in real arithmetic. Project the complete
+  // hidden row of each partial before the existing all-reduce/mHC fusion. BF16 order differs
+  // from projecting the rounded sum. The local numerical/graph test covers the projection
+  // itself; it does not establish full-model equality with the post-reduction path.
+  project_creative(part, R, L, false);
   l2pf(4, L, R);
   join(sa);
   ops::allreduce_hc(ch, part, false, R, x, a_post, a_comb, a_pre, mid, yraw, dumps ? sub : nullptr, st);
@@ -870,6 +878,62 @@ void Model::Impl::forward_rows(int R, int ctx, uint32_t flags, Sink* sink, int p
 
 Model::Model(int rank, const Options& opt) : d_(std::make_unique<Impl>(rank, opt)) {}
 Model::~Model() = default;
+
+void Model::load_creative(const std::string& path, const std::string& scope, comm::Ring& ring) {
+  if (d_->creative_dirs || !d_->graphs.empty() || scope.empty()) die("creative: load once, before graphs, with a scope");
+  std::ifstream f(path, std::ios::binary);
+  char magic[8]; uint32_t layers = 0, dim = 0;
+  f.read(magic, 8); f.read(reinterpret_cast<char*>(&layers), 4); f.read(reinterpret_cast<char*>(&dim), 4);
+  if (!f || std::memcmp(magic, "DSCR0001", 8) || layers != kLayers || dim != kDim)
+    die("creative: bad asset header %s", path.c_str());
+  std::vector<float> dirs((size_t)layers * dim);
+  f.read(reinterpret_cast<char*>(dirs.data()), dirs.size() * sizeof(float));
+  if (!f || f.peek() != std::char_traits<char>::eof()) die("creative: wrong asset length");
+  for (int l = 0; l < kLayers; ++l) {
+    double norm = 0;
+    for (int j = 0; j < kDim; ++j) {
+      const float x = dirs[(size_t)l * kDim + j];
+      if (!std::isfinite(x)) die("creative: non-finite direction");
+      norm += double(x) * x;
+    }
+    if (std::abs(norm - 1.) > 2e-4) die("creative: non-unit direction at layer %d", l);
+  }
+  auto hash = [](const void* p, size_t n) {
+    uint64_t h = 14695981039346656037ULL;
+    const auto* b = static_cast<const uint8_t*>(p);
+    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ULL;
+    return h;
+  };
+  uint64_t mine[2] = {hash(dirs.data(), dirs.size() * sizeof(float)), hash(scope.data(), scope.size())};
+  uint64_t all[4][2]; ring.allgather_host(mine, all, sizeof mine);
+  for (int r = 0; r < 4; ++r)
+    if (all[r][0] != mine[0] || all[r][1] != mine[1]) die("creative: asset/scope mismatch on rank %d", r);
+  d_->creative_scope = mine[1];
+  d_->creative_dirs = dalloc<float>(dirs.size());
+  d_->creative_lambda = dalloc<float>(1);
+  d_->creative_counts = dalloc<unsigned long long>(2 * kLayers);
+  CUDA_CHECK(cudaMemcpy(d_->creative_dirs, dirs.data(), dirs.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemset(d_->creative_lambda, 0, sizeof(float)));
+  CUDA_CHECK(cudaMemset(d_->creative_counts, 0, 2 * kLayers * sizeof(unsigned long long)));
+  std::printf("creative: rank %d loaded 40x5120 directions; scope %016llx; lambda 0/1.5; %s\n",
+              d_->rank, (unsigned long long)mine[1], scope.c_str());
+}
+bool Model::creative_enabled() const { return d_->creative_dirs != nullptr; }
+uint64_t Model::creative_scope() const { return d_->creative_scope; }
+void Model::set_creative(int mode) {
+  if (mode < 0 || mode > 1 || (mode && !creative_enabled())) die("creative: unsupported mode %d", mode);
+  if (mode == d_->creative_mode) return;
+  d_->drain();
+  d_->spec_invalidate();
+  unsigned long long counts[2 * kLayers];
+  CUDA_CHECK(cudaMemcpy(counts, d_->creative_counts, sizeof counts, cudaMemcpyDeviceToHost));
+  const float lam = mode ? 1.5f : 0.f;
+  CUDA_CHECK(cudaMemcpy(d_->creative_lambda, &lam, sizeof lam, cudaMemcpyHostToDevice));
+  d_->creative_mode = mode;
+  std::printf("creative: rank %d mode %d lambda %.1f counts", d_->rank, mode, lam);
+  for (const auto n : counts) std::printf(" %llu", n);
+  std::printf("\n"); std::fflush(stdout);
+}
 void Model::bind(dsw::WeightFile& wf, comm::Ring& ring) { d_->bind(wf, ring); }
 void Model::bind_ring2(comm::Ring& ring) { d_->ch2 = ring.dev(), d_->has_ch2 = true; }
 size_t Model::code_head(int* raw_tiles) { return d_->code_head(raw_tiles); }
@@ -898,7 +962,7 @@ void Model::step(const Ctl& c, int32_t* sampled, Sink* sink) {
   const SampleOut& o = d_->wait(d_->launch(c.rows, c.pos0, c.tokens, sp, c.flags, sink));
   for (int r = 0; r < c.rows; ++r) sampled[r] = o.row[r].token;
 }
-void Model::reset() { d_->hist.clear(); }
+void Model::reset() { d_->hist.clear(); d_->spec_invalidate(d_->cur_slot); }
 void Model::set_pos_stride(int stride, int group) {
   d_->pos_stride = std::max(1, stride);
   d_->pos_group = std::max(1, group);

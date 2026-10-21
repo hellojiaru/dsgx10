@@ -12,6 +12,7 @@
 #include "comm/ring.h"
 #include "engram/engram.h"
 #include "model/config.h"
+#include "model/ced_policy.h"
 #include "model/ops.h"
 #include "weights/loader.h"
 
@@ -124,7 +125,8 @@ struct Options {
   // The draft pass's cheaper formats (docs/engine.md, "The draft pass's approximations"; bundle B), drafts only:
   bool draft_head4 = false;    // the head as MXFP4, made from the FP8 copy (dspark::head_fp4; +88 MB, the FP8
                                // copy freed): the study's simulated FP4 head bit for bit
-  bool draft_markov8 = false;  // the Markov head as FP8 (dspark::markov_fp8; +8.3 MB)
+  bool draft_markov8 = false;
+  bool spec_probabilistic = false; // opt-in full-support probability proposals (T>0/P1/K0)  // the Markov head as FP8 (dspark::markov_fp8; +8.3 MB)
   int slots = 1;            // session slots (docs/batching.md): live sessions' states side by side (each one's
                             // window rings, compressed caches, index keys, carries and draft windows), up to
                             // kMaxSlots; ~240 MB a slot at 262,144 positions
@@ -161,6 +163,10 @@ class Model {
   size_t code_head(int* raw_tiles = nullptr);
   // The Engram row store of this rank (owned by the caller).
   void set_engram(const engram::HashMap* map, engram::Store* store);
+  void load_creative(const std::string& path, const std::string& scope, comm::Ring& ring);
+  void set_creative(int mode);  // 0 Normal, 1 Creative; only at drained command boundaries
+  bool creative_enabled() const;
+  uint64_t creative_scope() const;
   // Session slots (Options::slots). From now on the eager paths (prefill chunks, the state operations,
   // snapshots) act on slot s, and the steps launched have their rows in slot s. Every rank must make the
   // same calls. Slot 0 at the start.
@@ -224,11 +230,16 @@ class Model {
   // for it), else ~0. prefill_lookup() starts a chunk's Engram lookups early (the next chunk's, while
   // this one runs); prefill() starts them itself when they were not.
   // With ced (docs/ced.md) the chunk runs the encoder (layers 0-19) and layer 20's KV projection only;
-  // the chunk that samples then replays layers 20-39 over its last 128 positions [P - 128, P) from
-  // fresh decoder rings, and samples that replay's last row. Those 128 positions must have run through
-  // CED chunks of one run (each chunk starting where the one before ended), P >= 128. Of the snapshots
+  // the chunk that samples then replays layers 20-39 over its last replay_rows positions from
+  // fresh decoder rings, and samples that replay's last row. All replay rows must have run through
+  // CED chunks of one run (each chunk starting where the one before ended), P >= replay_rows. Of the snapshots
   // only one at P covers the decoder layers; the others hold the encoder layers' rings only.
   void set_tokens(int pos0, int n, const int32_t* tokens);
+  // Complete image layout for the current slot, including cached history. Installed once per
+  // request/resume before Engram lookups; CED replay uses this layout without original features.
+  void set_vision_layout(const std::vector<ops::VisionSpan>& spans);
+  // Bounded features for one encoder chunk. Does not change the complete layout or Engram prefetch.
+  void set_vision_chunk(const std::vector<ops::VisionSpan>& spans, const uint16_t* features, int rows);
   void prefill_lookup(int a, int M);
   // The prefill path's buffers and the weights it gathers, made now instead of by the first prefill:
   // every rank at the same point, after set_engram(). This rank's allocations come before ring's host
@@ -236,7 +247,7 @@ class Model {
   // the barrier. Returns this rank's free device memory afterwards.
   size_t prefill_init(comm::Ring& ring);
   uint64_t prefill(int a, int M, const Sampling* sp = nullptr, int handle = -1, const std::vector<int>& snaps = {},
-                   bool ced = false);
+                   bool ced = false, int replay_rows = kCedReplayRows);
   // The last prefill chunk's GPU time in ms (waits for the chunk): [0] the encoder (layers 0-19; every
   // layer without ced), [1] CED's projection, keep and replay, [2] the head and the sampling, [3] the
   // draft module's windows.

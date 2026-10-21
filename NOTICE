@@ -1,6 +1,7 @@
 # Notices for third-party material in dsgx10
 
-The project's own code is under the MIT licence (the root LICENSE). Third-party material in this tree,
+The upstream project's own code is under the MIT licence (the root LICENSE). The additional
+DeepInfer-derived portions identified below carry Apache-2.0 terms. Third-party material in this tree,
 with its licence:
 
 - `ds41f-4xgx10-switchless/ref/inference`, `ref/encoding`, `ref/config.json`, `ref/tokenizer_config.json`
@@ -28,3 +29,31 @@ with its licence:
   separate checkout.
 
 No model weights are included.
+
+## Additional material in the multimodal agent fork
+
+- Probabilistic speculative-sampling additions in
+  `ds41f-4xgx10-switchless/engine/common/spec_sampling.h`, `engine/model/sample.cu`,
+  and `engine/dspark/dspark.cu` were reimplemented after consulting DeepInfer,
+  https://github.com/deepseek-ai/DeepInfer, revision
+  `8b16149741a4935e1dec8cea27853f273b374c5b`, specifically
+  `deepinfer/model_executor/models/mtp/dflash.py` and
+  `deepinfer/model_executor/layers/tilelang_ops/cuda/fused_sample.py`.
+  DeepInfer is licensed under Apache-2.0; its full license is reproduced in
+  `LICENSES/Apache-2.0-DeepInfer.txt`. Existing dsgx10 portions remain MIT;
+  DeepInfer-derived probability additions are provided under Apache-2.0.
+  Modifications adapt proposal capture, probability-ratio acceptance and residual
+  sampling to C++/CUDA and native ring communication, with per-slot lifecycle,
+  Graph integration and independent random streams. The implementation does not
+  copy the entire DeepInfer runtime or its residual penalty constant.
+  See `docs/publication/provenance.md` for the fixed source links and change map.
+  The referenced DeepInfer revision does not contain a root NOTICE file; this is
+  this fork's attribution, not a reproduction of an upstream NOTICE.
+- `ds41f-4xgx10-switchless/vision/reference_image_processor.py` is copied from
+  the bundled `ref/inference/image_processor.py`; `vision/reference_vision.py`
+  adapts bundled `ref/inference/vision.py` with an explicit SDPA batch dimension
+  and cosine/sine device transfer. These DeepSeek-derived files remain under
+  the DeepSeek MIT license, Copyright (c) 2023 DeepSeek, reproduced in
+  `ds41f-4xgx10-switchless/ref/LICENSE-deepseek`.
+
+These notices do not relicense external dependencies or model weights.

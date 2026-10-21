@@ -9,12 +9,12 @@ use crate::encoding::{api_tool_name, encode_messages, Delta, EncodeOptions, Enco
 use crate::engine::{EngineClient, Event as EngineEvent};
 use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
 use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
-use crate::protocol::{DoneReason, Submit, FLAG_KEEP, FLAG_SEED};
+use crate::protocol::{DoneReason, Submit, FLAG_KEEP, FLAG_SEED, FLAG_CREATIVE};
 use crate::pyjson::truthy;
 use crate::session::SessionTable;
 use crate::tokenizer::{StreamDecoder, Tokenizer};
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -27,8 +27,49 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisionPrefixPolicy {
+    Legacy,
+    Exact,
+    TailExact,
+}
+
+impl VisionPrefixPolicy {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "exact" => Ok(Self::Exact),
+            "tail-exact" => Ok(Self::TailExact),
+            _ => Err("--vision-prefix-policy must be legacy, exact, or tail-exact".into()),
+        }
+    }
+
+    pub fn flags(self) -> u32 {
+        match self {
+            Self::Legacy => 0,
+            Self::Exact => crate::protocol::FLAG_FULL_PREFIX,
+            Self::TailExact => crate::protocol::FLAG_TAIL_PREFIX,
+        }
+    }
+
+    fn cache_tag(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy-v1",
+            Self::Exact => "full-v1",
+            Self::TailExact => "tail-v1",
+        }
+    }
+
+    pub fn shared_image_prefix(self) -> bool { self != Self::Legacy }
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
+    pub creative: bool,
+    pub vision_prefix_policy: VisionPrefixPolicy,
+    pub cache_scope: String,
+    pub vision_socket: Option<String>,
+    pub vision_revision: Option<String>,
     pub model_name: String,
     pub api_key: Option<String>,
     /// Default and cap for max_tokens (the kit's DSV41_MAX_NEW_TOKENS).
@@ -56,6 +97,7 @@ pub struct App {
     pub engine: EngineClient,
     pub gate: Arc<Gate>,
     sessions: Mutex<SessionTable>,
+    vision_cache: tokio::sync::Mutex<crate::vision::FeatureCache>,
     think_end_id: Option<u32>,
     counter: AtomicU64,
 }
@@ -64,7 +106,7 @@ impl App {
     pub fn new(cfg: ServerConfig, tok: Arc<Tokenizer>, engine: EngineClient) -> Arc<App> {
         let think_end_id = tok.token_id("</think>");
         let gate = Gate::new(cfg.hold);
-        Arc::new(App { cfg, tok, engine, gate, sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0) })
+        Arc::new(App { cfg, tok, engine, gate, vision_cache: Default::default(), sessions: Mutex::new(SessionTable::new(256, 16 << 20)), think_end_id, counter: AtomicU64::new(0) })
     }
 
     /// The session table an earlier run saved (session.rs `load`), for the next turns of its
@@ -106,13 +148,25 @@ impl App {
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/telemetry", get(telemetry))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
+        // A 1M-token text request exceeds Axum's default 2 MiB Bytes limit.
+        // Match the existing gateway ceiling; token admission remains below.
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .with_state(app)
 }
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+async fn telemetry(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if let Err(r) = check_auth(&app, &headers) { return r; }
+    let mut value = app.engine.telemetry().snapshot();
+    value["engine_connected"] = json!(app.engine.info().is_some());
+    value["model_name"] = json!(app.cfg.model_name);
+    axum::Json(value).into_response()
 }
 
 fn error(status: StatusCode, kind: &str, msg: impl Into<String>) -> Response {
@@ -182,17 +236,31 @@ async fn models(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         return r;
     }
     let max_len = app.engine.info().map(|i| i.max_context);
-    let body = json!({"object": "list", "data": [{
-        "id": app.cfg.model_name, "object": "model", "created": 0, "owned_by": "dsgb10",
-        "root": app.cfg.model_name, "max_model_len": max_len}]});
+    let names = if app.cfg.creative {
+        vec![format!("{}-normal", app.cfg.model_name), format!("{}-creative", app.cfg.model_name)]
+    } else { vec![app.cfg.model_name.clone()] };
+    let models: Vec<_> = names.iter().map(|name| json!({
+        "id": name, "object": "model", "created": 0, "owned_by": "dsgb10",
+        "root": app.cfg.model_name, "max_model_len": max_len,
+        "input_modalities": if app.cfg.vision_socket.is_some() { vec!["text", "image"] } else { vec!["text"] },
+        "output_modalities": ["text"]})).collect();
+    let body = json!({"object": "list", "data": models});
     (StatusCode::OK, [("content-type", "application/json")], body.to_string()).into_response()
 }
 
 // ------------------------------------------------------------------ request → prompt
 
+fn default_model_name(cfg: &ServerConfig) -> String {
+    if cfg.creative { format!("{}-normal", cfg.model_name) } else { cfg.model_name.clone() }
+}
+
 /// What the request asks for, with the prompt rendered.
 pub struct Prepared {
+    pub selected_model: String,
+    pub creative: bool,
+    pub cache_namespace: String,
     pub prompt: String,
+    pub images: Vec<Value>,
     pub mode: ThinkingMode,
     pub tools: bool,
     pub stream: bool,
@@ -261,7 +329,7 @@ fn tool_payload(t: &Value) -> Result<Value, String> {
         return Err("each tool function needs a name".into());
     }
     let mut out = Map::new();
-    for k in ["name", "description", "parameters", "strict"] {
+    for k in ["name", "description", "parameters", "strict", "namespace"] {
         if let Some(v) = f.get(k) {
             if !v.is_null() {
                 out.insert(k.into(), v.clone());
@@ -303,12 +371,15 @@ fn convert_messages(msgs: &[Value]) -> Result<Vec<Value>, String> {
         let mut n = Map::new();
         n.insert("role".into(), json!(role));
         let content = match o.get("content") {
+            // 1017 gives a tool's own blocks precedence only when content is not a string.
+            // Do not manufacture an empty string that silently suppresses those blocks.
+            None | Some(Value::Null) if o.get("content_blocks").is_some() => Value::Null,
             None | Some(Value::Null) => json!(""),
             Some(Value::Array(parts)) => {
                 for p in parts {
                     match p.get("type").and_then(Value::as_str) {
-                        Some("image_url" | "image" | "input_image" | "video_url" | "input_audio" | "audio_url") => {
-                            return Err("image, audio and video input are not supported".into())
+                        Some("input_image" | "video_url" | "input_audio" | "audio_url") => {
+                            return Err("use image_url blocks for images; audio and video input are not supported".into())
                         }
                         _ => {}
                     }
@@ -318,7 +389,7 @@ fn convert_messages(msgs: &[Value]) -> Result<Vec<Value>, String> {
             Some(c) => c.clone(),
         };
         n.insert("content".into(), content);
-        for k in ["name", "tool_calls", "tool_call_id", "reasoning_content"] {
+        for k in ["name", "tool_calls", "tool_call_id", "reasoning_content", "content_blocks"] {
             if let Some(v) = o.get(k) {
                 if !v.is_null() {
                     n.insert(k.into(), v.clone());
@@ -337,6 +408,22 @@ fn convert_messages(msgs: &[Value]) -> Result<Vec<Value>, String> {
 
 pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
     let r = req.as_object().ok_or("the request body must be a JSON object")?;
+    let default_model = if cfg.creative { format!("{}-normal", cfg.model_name) } else { cfg.model_name.clone() };
+    let selected_model = match r.get("model") {
+        None => default_model,
+        Some(Value::String(s)) => s.clone(),
+        _ => return Err("model must be a string".into()),
+    };
+    let creative = cfg.creative && selected_model == format!("{}-creative", cfg.model_name);
+    if selected_model != cfg.model_name && selected_model != default_model_name(cfg) && !creative {
+        return Err("unknown model alias".into());
+    }
+    let salt = match r.get("cache_salt") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(s)) if s.len() <= 4096 => s,
+        _ => return Err("cache_salt must be a string of at most 4096 bytes".into()),
+    };
+    let cache_namespace = format!("{}:{:?}:{}:{}:{}", cfg.cache_scope, cfg.encoding, creative as u8, cfg.vision_prefix_policy.cache_tag(), salt);
     let msgs = r.get("messages").and_then(Value::as_array).ok_or("messages must be a list")?;
     if msgs.is_empty() {
         return Err("messages must not be empty".into());
@@ -386,7 +473,10 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
     let mut o = EncodeOptions::new(mode);
     o.reasoning_effort = Some(&budget);
     o.encoding = cfg.encoding;
-    let (prompt, _) = encode_messages(&messages, &o).map_err(|e| format!("cannot encode messages: {e}"))?;
+    let (prompt, images) = encode_messages(&messages, &o).map_err(|e| format!("cannot encode messages: {e}"))?;
+    if !images.is_empty() && (cfg.vision_socket.is_none() || cfg.vision_revision.is_none()) {
+        return Err("native vision encoder is not configured".into());
+    }
 
     // sampling and limits
     let max_tokens = match r.get("max_completion_tokens").filter(|v| !v.is_null()).or(r.get("max_tokens").filter(|v| !v.is_null())) {
@@ -422,7 +512,11 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
     let stream = truthy(r.get("stream"));
     let include_usage = truthy(r.get("stream_options").and_then(|s| s.get("include_usage")));
     Ok(Prepared {
+        selected_model,
+        creative,
+        cache_namespace,
         prompt,
+        images,
         mode,
         tools: !tools.is_empty(),
         stream,
@@ -458,6 +552,7 @@ impl Finish {
 }
 
 struct Usage {
+    image_tokens: usize,
     prompt: usize,
     cached: u32,
     completion: usize,
@@ -468,7 +563,7 @@ impl Usage {
     fn json(&self) -> Value {
         json!({"prompt_tokens": self.prompt, "completion_tokens": self.completion,
                "total_tokens": self.prompt + self.completion,
-               "prompt_tokens_details": {"cached_tokens": self.cached},
+               "prompt_tokens_details": {"cached_tokens": self.cached, "image_tokens": self.image_tokens},
                "completion_tokens_details": {"reasoning_tokens": self.reasoning}})
     }
 }
@@ -482,6 +577,7 @@ struct Gen {
     session_id: u64,
     prompt_text: String,
     prompt_ids: Vec<u32>,
+    image_tokens: usize,
     rx: mpsc::UnboundedReceiver<EngineEvent>,
     stop_ids: Vec<u32>,
     stopper: StopMatcher,
@@ -494,6 +590,7 @@ struct Gen {
     gen_bytes: Vec<u8>,
     gen_ends: Vec<usize>,
     stopped: Option<Finish>,
+    failure: Option<String>,
     done: bool,
     t0: Instant,
     first_token: Option<Instant>,
@@ -544,20 +641,22 @@ impl Gen {
                             if let Some(keep) = g.check(out_ids, &tail) {
                                 eprintln!("req {}: repetition loop after {} tokens; keeping {keep}", self.req_id, out_ids.len());
                                 self.stopped = Some(Finish::Stop);
+                                self.failure = Some("generation_aborted_repetition: repeated output detected; generation did not complete".into());
                                 self.app.engine.cancel(self.req_id);
                             }
                         }
                     }
+                    self.app.engine.telemetry().accepted(self.req_id, self.kept);
                     if !out.is_empty() {
                         return None;
                     }
                 }
                 EngineEvent::Done(d) => {
                     self.done = true;
-                    if d.reason == DoneReason::Error {
+                    if self.failure.is_some() || d.reason == DoneReason::Error {
                         self.app.sessions.lock().unwrap().abandon(self.session_id);
                         self.app.engine.release(self.session_id);
-                        return Some(Err(if d.error.is_empty() { "engine error".into() } else { d.error }));
+                        return Some(Err(self.failure.take().unwrap_or_else(|| if d.error.is_empty() { "engine error".into() } else { d.error })));
                     }
                     if self.stopped.is_none() {
                         self.flush(out);
@@ -579,7 +678,7 @@ impl Gen {
                         _ => 0,
                     };
                     self.app.sessions.lock().unwrap().finish(self.session_id, &self.prompt_text, &self.prompt_ids, &self.ids, &self.app.tok);
-                    let usage = Usage { prompt: self.prompt_ids.len(), cached: d.cached_tokens, completion: self.kept, reasoning };
+                    let usage = Usage { image_tokens: self.image_tokens, prompt: self.prompt_ids.len(), cached: d.cached_tokens, completion: self.kept, reasoning };
                     let total = self.t0.elapsed().as_secs_f64();
                     let ttft = self.first_token.map_or(total, |t| (t - self.t0).as_secs_f64());
                     if let Some(dir) = &self.app.cfg.dump_dir {
@@ -626,6 +725,7 @@ impl Gen {
 
 impl Drop for Gen {
     fn drop(&mut self) {
+        self.app.engine.telemetry().client_closed(self.req_id);
         if !self.done {
             // The client went away mid-request. A cancelled session keeps what it processed, of
             // which what we received is a prefix: still good for the conversation's next turn.
@@ -640,12 +740,26 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
     let Some(info) = app.engine.info() else {
         return Err(unavailable("engine not connected".into()));
     };
+    let request_started = Instant::now();
+    let expanded = if p.images.is_empty() && !app.cfg.vision_prefix_policy.shared_image_prefix() {
+        crate::vision::Expanded { prompt: p.prompt.clone(), scope: p.cache_namespace.clone(), images: Vec::new(), cache_images: Vec::new() }
+    } else {
+        let mut cache = app.vision_cache.lock().await;
+        crate::vision::materialize_cached(&mut cache,
+            app.cfg.vision_socket.as_deref().ok_or_else(|| unavailable("vision socket missing".into()))?,
+            app.cfg.vision_revision.as_deref().ok_or_else(|| unavailable("vision revision missing".into()))?,
+            &p.images, &p.prompt, &p.cache_namespace, &app.tok, app.cfg.tokenize_threads).await
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, "invalid_request_error".into(), e))?
+    };
+    let image_tokens: usize = expanded.images.iter().map(|x| x.rows as usize).sum();
     let (plan, released) = {
         let app2 = app.clone();
-        let text = p.prompt.clone();
+        let text = expanded.prompt.clone();
+        let scope = expanded.scope.clone();
+        let cache_images = expanded.cache_images.clone();
         tokio::task::spawn_blocking(move || {
             let mut t = app2.sessions.lock().unwrap();
-            t.plan(&text, &app2.tok, app2.cfg.tokenize_threads)
+            t.plan_images(&text, &scope, &cache_images, &app2.tok, app2.cfg.tokenize_threads)
         })
         .await
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "server_error".into(), e.to_string()))?
@@ -676,11 +790,12 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         top_p: p.top_p,
         top_k: p.top_k,
         max_new_tokens: max_new,
-        flags: FLAG_KEEP | if p.seed.is_some() { FLAG_SEED } else { 0 },
+        flags: FLAG_KEEP | app.cfg.vision_prefix_policy.flags() | if p.seed.is_some() { FLAG_SEED } else { 0 } | if p.creative { FLAG_CREATIVE } else { 0 },
         n_top_logprobs: 0,
         prefix_hint: plan.reused as u32,
         stop_ids: stop_ids.clone(),
         prompt: plan.ids.clone(),
+        images: expanded.images,
     };
     let (req_id, rx) = match app.engine.submit(submit) {
         Ok(x) => x,
@@ -690,13 +805,14 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         }
     };
     // where it starts (counts only); rank 0's "serve: req N restart:" line says what the engine found
-    eprintln!("req {req_id} plan: {}", plan.describe(p.prompt.len()));
+    eprintln!("req {req_id} plan: {}", plan.describe(expanded.prompt.len()));
     Ok(Gen {
         app: app.clone(),
         _pass: pass,
         req_id,
         session_id: plan.session_id,
-        prompt_text: p.prompt.clone(),
+        prompt_text: expanded.prompt,
+        image_tokens,
         prompt_ids: plan.ids,
         rx,
         stop_ids,
@@ -708,8 +824,9 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         gen_bytes: Vec::new(),
         gen_ends: Vec::new(),
         stopped: None,
+        failure: None,
         done: false,
-        t0: Instant::now(),
+        t0: request_started,
         first_token: None,
     })
 }
@@ -751,7 +868,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     dump(&app, &req, &p, &gen);
     let id = format!("chatcmpl-{}", app.random_hex(24));
     let created = now_secs();
-    let model = app.cfg.model_name.clone();
+    let model = p.selected_model.clone();
     // non-streaming
     let (mut reasoning, mut content, mut calls) = (String::new(), String::new(), Vec::new());
     let mut out = Vec::new();
@@ -831,7 +948,7 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
         dump(&app, &req, &p, &gen);
         let id = format!("chatcmpl-{}", app.random_hex(24));
         let created = now_secs();
-        let model = app.cfg.model_name.clone();
+        let model = p.selected_model.clone();
         let chunk = |delta: Value, finish: Option<&str>| {
             json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                    "choices": [{"index": 0, "delta": delta, "logprobs": null, "finish_reason": finish}]})
@@ -886,6 +1003,11 @@ mod tests {
     fn cfg() -> ServerConfig {
         ServerConfig {
             model_name: "m".into(),
+            vision_socket: None,
+            vision_revision: None,
+            vision_prefix_policy: VisionPrefixPolicy::Legacy,
+            creative: false,
+            cache_scope: "test".into(),
             api_key: None,
             max_tokens_cap: 32768,
             default_effort: 75,
@@ -917,6 +1039,39 @@ mod tests {
         ] {
             assert_eq!(effort_budget(Some(&v), 75), want, "{v}");
         }
+    }
+
+    #[test]
+    fn creative_aliases_and_cache_namespaces() {
+        let mut c=cfg(); c.creative=true; c.cache_scope="revision:asset".into();
+        let req=json!({"model":"m-normal","messages":[{"role":"user","content":"hello"}]});
+        let n=prepare(&c,&req).unwrap(); assert!(!n.creative);
+        let mut q=req.clone(); q["model"]=json!("m-creative");
+        let p=prepare(&c,&q).unwrap(); assert!(p.creative); assert_eq!(p.selected_model,"m-creative");
+        assert_eq!(p.prompt,n.prompt); assert_ne!(p.cache_namespace,n.cache_namespace);
+        q["model"]=json!("unknown"); assert!(prepare(&c,&q).is_err());
+        q["model"]=json!("m-creative"); c.creative=false; assert!(prepare(&c,&q).is_err());
+        q["model"]=json!("m"); q["cache_salt"]=json!(["invalid"]); assert!(prepare(&c,&q).is_err());
+    }
+
+    #[test]
+    fn prefill_policy_wire_and_cache_isolation() {
+        let mut c = cfg();
+        let req = json!({"model":"m","messages":[{"role":"user","content":"same text"}]});
+        let mut namespaces = std::collections::HashSet::new();
+        for (text, policy, flag) in [
+            ("legacy", VisionPrefixPolicy::Legacy, 0),
+            ("exact", VisionPrefixPolicy::Exact, crate::protocol::FLAG_FULL_PREFIX),
+            ("tail-exact", VisionPrefixPolicy::TailExact, crate::protocol::FLAG_TAIL_PREFIX),
+        ] {
+            assert_eq!(VisionPrefixPolicy::parse(text).unwrap(), policy);
+            assert_eq!(policy.flags(), flag);
+            c.vision_prefix_policy = policy;
+            namespaces.insert(prepare(&c, &req).unwrap().cache_namespace);
+        }
+        assert_eq!(namespaces.len(), 3);
+        assert!(VisionPrefixPolicy::parse("auto").is_err());
+        assert!(VisionPrefixPolicy::TailExact.shared_image_prefix());
     }
 
     #[test]

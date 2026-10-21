@@ -19,6 +19,7 @@
 #include "kernels/dsk.h"
 #include "model/model.h"
 #include "model/ops.h"
+#include "model/creative.h"
 
 namespace model {
 namespace detail {
@@ -59,7 +60,7 @@ struct LayerW {
   const bf16* ix_wproj = nullptr;
   // FFN
   uint8_t* gate = nullptr;  // bf16 [384][5120], tile_fp8 layout: every rank's 96 rows, all-gathered at bind
-  const float* gate_bias = nullptr;
+  const float *gate_bias = nullptr, *gate_bias_vl = nullptr;
   dsk::MoeWeights moe{};
   // mHC: the full projections [24][20480] (all-gathered at bind), base [24], scale [3]
   float* hc_fn[2] = {};
@@ -109,6 +110,15 @@ struct Model::Impl {
   comm::DevChannel ch2{};  // --wave-probe
   bool has_ch2 = false;
   bool bound = false;
+  float *creative_dirs = nullptr, *creative_lambda = nullptr;
+  unsigned long long* creative_counts = nullptr;  // 40 decode counters, then 40 prefill counters
+  int creative_mode = 0;
+  uint64_t creative_scope = 0;
+  void project_creative(bf16* output, int rows, int layer, bool prefill) {
+    if (creative_dirs)
+      creative::project(output, rows, creative_dirs + (size_t)layer * kDim, creative_lambda,
+                        creative_counts + layer + (prefill ? kLayers : 0), st);
+  }
 
   // weights
   detail::LayerW lw[kLayers];
@@ -173,6 +183,13 @@ struct Model::Impl {
   std::vector<int32_t> hist;  // token ids of the sequence so far (hashing reads 3 back): the current slot's
   std::vector<int32_t> hists[kMaxSlots];  // the other slots' (use_slot swaps them in and out)
   std::vector<int32_t>& hist_of(int s) { return s == cur_slot ? hist : hists[s]; }
+  std::vector<uint8_t> vision_live[kMaxSlots];  // fixed max_ctx mask for each active slot; empty = text
+  const uint8_t* live_of(int s) const { return vision_live[s].empty() ? nullptr : vision_live[s].data(); }
+  ops::VisionSpan* vision_spans = nullptr;  // complete absolute layout, used by CED's mask-only replay
+  ops::VisionSpan* vision_feature_spans = nullptr;  // images intersecting the current encoder chunk
+  bf16* vision_features = nullptr;
+  int vision_count = 0, vision_capacity = 0, vision_span_capacity = 0;  // shared prefill-only buffers, never read by decode graphs
+  int vision_feature_count = 0, vision_feature_span_capacity = 0;
   std::vector<uint32_t> ids;  // [R][2][24]
   uint8_t* e_send[2];         // pinned: this rank's packed records per Engram layer
   uint32_t* e_off[2];         // pinned: [R][24] offsets into the gathered segments
@@ -288,7 +305,8 @@ struct Model::Impl {
   void wave_probe(int L, int a, int M);
   // positions [p0, p1) between layer L's ring and the linear window buffer that starts at position base
   void ring_copy(int L, int p0, int p1, int base, bool to_lin);
-  uint64_t prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snaps, bool ced);
+  uint64_t prefill(int a, int M, const Sampling* sp, int handle, const std::vector<int>& snaps, bool ced,
+                   int replay_rows);
   // CED (docs/ced.md): layer 20's compressor for an encoder chunk's rows; keeping the chunk's last
   // positions' layer-20 input; the decoder replay of [P - 128, P)
   void ced_project(int M);
@@ -322,6 +340,7 @@ struct Model::Impl {
   // ---- DSpark (spec.cu) -----------------------------------------------------------------------
   void bind_spec(dsw::WeightFile& wf);
   void spec_head_coded();  // code_head: the draft module's bf16 head GEMV on the coded head
+  void spec_invalidate(int slot = -1); // proposal distributions are never cache/snapshot state
   void spec_use_slot(int s);  // the draft module's eager paths act on slot s's windows
   void spec_hidden(int L, int R);  // main_hidden of the step's rows at the input of layer L
   // prefill: main_hidden of the rows that enter the draft's window (the chunk's last 256, the 128 before

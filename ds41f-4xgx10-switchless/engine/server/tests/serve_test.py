@@ -47,8 +47,10 @@ class Engine:
         assert t == HELLO_E, t
         ver, self.max_ctx, vocab, eos, max_sess, nl = struct.unpack('<6I', p[:24])
         self.name = p[24:24 + nl].decode()
-        self.send(HELLO, struct.pack('<II', 1, 0))
+        assert ver == 3, ver
+        self.send(HELLO, struct.pack('<II', 3, 0))
         self.next_id = 1
+        self.creative = False
 
     def send(self, t, payload):
         self.s.sendall(struct.pack('<IHH', len(payload), t, 0) + payload)
@@ -67,10 +69,11 @@ class Engine:
         return t, self.recv_exact(size)
 
     def submit(self, session, prompt, max_new=32, base=0, temp=0.0, top_p=1.0, top_k=0, seed=None, keep=True,
-               n_top=None, stop=(1,)):
+               n_top=None, stop=(1,), creative=None):
         rid = self.next_id
         self.next_id += 1
         flags = (F_KEEP if keep else 0) | (F_SEED if seed is not None else 0) | (F_LOGPROBS if n_top is not None else 0)
+        if self.creative if creative is None else creative: flags |= 8
         hdr = struct.pack('<QQQQffIIIIIIII', rid, session, base, seed or 0, temp, top_p, top_k, max_new, flags,
                           n_top or 0, 0, len(stop), len(prompt), 0)
         assert len(hdr) == 72
@@ -340,10 +343,15 @@ def main():
     ap.add_argument('--socket', default='/tmp/dsgb10-engine.sock')
     ap.add_argument('--tokens', default='/data/dsgb10/golden/long/tokens.npy')
     ap.add_argument('--speed', action='store_true')
+    ap.add_argument('--creative', action='store_true')
     ap.add_argument('--ced', action='store_true', help="CED's turn rule (the server's default; else --exact)")
     a = ap.parse_args()
     T = load_npy_i32(a.tokens)
     e = Engine(a.socket)
+    e.creative = a.creative
+    if a.ced:
+        # A prior interrupted test can leave these fixed IDs resident. Start this suite cold.
+        for sid in range(1, 16): e.release(0x5ced000000000000 + sid)
     print('engine: %s, context %d' % (e.name, e.max_ctx))
     if a.speed:
         speed(e, T)

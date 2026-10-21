@@ -1,5 +1,16 @@
 # dsgx10
 
+> **Multimodal agent fork:** this branch adds native image encoding, image-aware
+> prefix caching, protocol 5 file-backed image features, and optional
+> probabilistic DSpark. Start with the **[fork guide](docs/publication/README.md)**
+> and **[build/test instructions](docs/publication/build-and-test.md)**.
+>
+> The upstream description and benchmark history below are preserved. Their
+> historical serving state and performance numbers do not describe a fresh
+> measurement of this fork. In particular, this fork's image path adds a Python
+> runtime worker. See [measurement scope and known limits](docs/publication/measurements.md)
+> before comparing results.
+
 From-scratch inference engines for NVIDIA GB10 boxes.
 Each directory is one configuration — a model, a set of boxes, a topology — and is
 specialised to it: speed over generality. Each is self-contained, with its own engine, front-end,
@@ -104,3 +115,21 @@ The code is under the MIT licence (the [LICENSE](LICENSE) file). `ds41f-4xgx10-s
 and `ref/encoding` are DeepSeek's reference code under their MIT licence (`ref/LICENSE-deepseek`); the
 agentic-edit bench carries the coding agent pi's prompt and tools (MIT, `bench/THIRD_PARTY.md`); other
 third-party material is listed in [NOTICE](NOTICE). No model weights are included.
+
+## Multimodal agent fork guide
+
+This branch adds native image encoding, image-aware prefix policies, bounded
+file-backed feature transport (protocol 5), and optional probabilistic DSpark to
+the `ds41f-4xgx10-switchless` configuration. Start with the
+[fork guide](docs/publication/README.md), [build and tests](docs/publication/build-and-test.md),
+and [measurement scope](docs/publication/measurements.md).
+
+The upstream text and benchmark history above are preserved; they are not new
+measurements of these additions. The image path adds a Python runtime worker.
+Known long-context visual reasoning errors remain, and historical throughput
+does not establish universal performance or end-to-end task quality.
+
+The original MIT license remains. DeepInfer-derived probabilistic additions
+carry Apache-2.0 attribution alongside the original MIT portions; see
+[NOTICE](NOTICE), [provenance](docs/publication/provenance.md), and the included
+[Apache-2.0 license](LICENSES/Apache-2.0-DeepInfer.txt).
