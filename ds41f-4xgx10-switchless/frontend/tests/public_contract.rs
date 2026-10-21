@@ -66,7 +66,11 @@ fn tool_result_picture_order_follows_calls_not_arrival() {
         {"role":"tool","tool_call_id":"first","content":null,"content_blocks":[picture(first)]}
     ]});
     let prepared = prepare(&config(), &request).unwrap();
-    assert_eq!(prepared.images, vec![json!({"url":first}), json!({"url":second})]);
+    // The canonical encoder records retain their image type as well as source URL.
+    assert_eq!(prepared.images, vec![
+        json!({"type":"image", "url":first}),
+        json!({"type":"image", "url":second}),
+    ]);
     assert_eq!(prepared.prompt.matches(IMAGE_PLACEHOLDER).count(), 2);
 }
 

@@ -20,7 +20,8 @@
     "Public smoke has no HTTP call by default and does not log environment authentication.",
     "No model weights, private image binaries, captured user prompts or deployment scripts are included.",
     "README now identifies the fork before upstream history. The public smoke extension/explicit thinking setting and text/finish checks are documented; changed script remains synthetic and opt-in.",
-    "LF normalization preserves Apache license/reference source content. Vision metadata retains historical runtime hashes separately from public LF hashes; the encoder cache identity must be freshly derived."
+    "LF normalization preserves Apache license/reference source content. Vision metadata retains historical runtime hashes separately from public LF hashes; the encoder cache identity must be freshly derived.",
+    "Post-publication CPU CI correction changes only public_contract.rs expected synthetic image records to include the existing type:image field; no runtime behavior or private fixture changed."
   ],
   "limitations": [
     "Pattern scans are not a general security or semantic secrecy proof.",
@@ -406,8 +407,8 @@
     },
     {
       "path": "ds41f-4xgx10-switchless/frontend/tests/public_contract.rs",
-      "bytes": 4595,
-      "sha256": "008b98f8867ab37ce99be09282496722bf77c635bde5f50148a5fd22cd5305ad"
+      "bytes": 4734,
+      "sha256": "b4af6606d3449fead5ac3ea6221b7dbac56f93fa29e0f8a74a9b7434a3463316"
     },
     {
       "path": "ds41f-4xgx10-switchless/frontend/tests/vision_prefix_transport.rs",
@@ -458,5 +459,15 @@
   "apache_license_lf_normalized_content_equal": true,
   "image_processor_lf_normalized_content_equal": true,
   "public_text_line_endings": "LF",
-  "inventory_hash_basis": "SHA-256 of actual LF-normalized public working-tree bytes, excluding this inventory itself."
+  "inventory_hash_basis": "SHA-256 of actual LF-normalized public working-tree bytes, excluding this inventory itself.",
+  "incremental_reviews": [
+    {
+      "date": "2026-10-21",
+      "base_public_commit": "9db03da",
+      "path": "ds41f-4xgx10-switchless/frontend/tests/public_contract.rs",
+      "sha256": "b4af6606d3449fead5ac3ea6221b7dbac56f93fa29e0f8a74a9b7434a3463316",
+      "scope": "Synthetic expected image object type field and explanatory comment only; runtime unchanged.",
+      "unresolved_findings": []
+    }
+  ]
 }
